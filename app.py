@@ -3,13 +3,15 @@
 Rodar no computador:  streamlit run app.py
 A chave da IA fica em .streamlit/secrets.toml (local) ou nos Secrets do Streamlit Cloud.
 """
+import datetime as dt
 import hashlib
 import urllib.parse
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
 from doe.atos import TERMOS_SECAMI
-from doe.coleta import ErroColeta, baixar_pdf, codigo_do_link, listar_edicoes
+from doe.coleta import ErroColeta, baixar_pdf, codigo_do_link, edicoes_da_data, ultima_edicao
 from doe.ia import MODELO_PADRAO
 from doe.mensagem import mensagem_unica
 from doe.pipeline import processar_pdf
@@ -29,9 +31,20 @@ def memoria_compartilhada():
     return {"resultados": {}, "ia": {"modelo": MODELO_PADRAO}}
 
 
-@st.cache_data(ttl=30 * 60, show_spinner=False)
-def edicoes_recentes():
-    return listar_edicoes()
+@st.cache_data(ttl=10 * 60, show_spinner="Consultando o Diário Oficial...")
+def edicoes_do_dia(data):
+    """Guardado por 10 min: a equipe toda reaproveita a mesma consulta."""
+    return edicoes_da_data(data)
+
+
+@st.cache_data(ttl=10 * 60, show_spinner="Procurando a última edição publicada...")
+def ultima_antes_de(data):
+    return ultima_edicao(ate=data)
+
+
+def hoje_em_goias():
+    """O servidor do Streamlit Cloud fica em outro fuso; a data vale pelo horário de Goiás."""
+    return dt.datetime.now(ZoneInfo("America/Sao_Paulo")).date()
 
 
 MEMORIA = memoria_compartilhada()
@@ -58,35 +71,42 @@ pdfs = []  # lista de (nome, bytes)
 aba_site, aba_upload = st.tabs(["🌐 Buscar no site", "📤 Enviar PDF"])
 
 with aba_site:
+    hoje = hoje_em_goias()
+    data = st.date_input("Data da edição", value=hoje, max_value=hoje, format="DD/MM/YYYY")
+
+    edicoes = []
     try:
-        edicoes, diagnostico = edicoes_recentes()
+        edicoes = edicoes_do_dia(data)
+        if not edicoes:
+            # fim de semana, feriado ou edição de hoje ainda não publicada
+            dia_anterior, edicoes = ultima_antes_de(data - dt.timedelta(days=1))
+            if edicoes:
+                st.info(f"Não há edição em {data:%d/%m/%Y}. "
+                        f"Mostrando a última publicada antes dessa data: **{dia_anterior:%d/%m/%Y}**.")
+            else:
+                st.warning("Não encontrei edições nos 10 dias anteriores a essa data.")
     except ErroColeta as erro:
-        edicoes, diagnostico = [], str(erro)
         st.error(str(erro))
 
+    escolhidas = []
     if edicoes:
         rotulos = {e["codigo"]: e["rotulo"] for e in edicoes}
-        escolhidas = st.multiselect("Edições", options=list(rotulos), default=list(rotulos)[:1],
+        escolhidas = st.multiselect("Edições do dia", options=list(rotulos), default=list(rotulos),
                                     format_func=lambda c: rotulos[c],
-                                    help="A mais recente já vem marcada. Inclua suplementos se houver.")
-    else:
-        escolhidas = []
-        st.info("Não encontrei a lista de edições na página do site. "
-                "Cole abaixo o link do botão DOWNLOAD do Diário, ou use a aba **Enviar PDF**.")
+                                    help="A edição principal e os suplementos do dia já vêm marcados.")
 
-    link = st.text_input("Ou cole o link de download (ou o código) de uma edição",
-                         placeholder="https://diariooficial.abc.go.gov.br/portal/edicoes/download/12345")
-    if link:
-        codigo = codigo_do_link(link)
-        if codigo:
-            escolhidas = list(dict.fromkeys(escolhidas + [codigo]))
-        else:
-            st.error("Link não reconhecido. Ele deve terminar em /portal/edicoes/download/<número>.")
-
-    with st.expander("Diagnóstico da coleta"):
-        st.write(diagnostico)
-        if st.button("Recarregar lista do site"):
-            edicoes_recentes.clear()
+    with st.expander("Outras opções"):
+        link = st.text_input("Colar link de download (ou código) de uma edição específica",
+                             placeholder="https://diariooficial.abc.go.gov.br/portal/edicoes/download/7422")
+        if link:
+            codigo = codigo_do_link(link)
+            if codigo:
+                escolhidas = list(dict.fromkeys(escolhidas + [codigo]))
+            else:
+                st.error("Link não reconhecido. Ele deve terminar em /portal/edicoes/download/<número>.")
+        if st.button("Consultar o site de novo"):
+            edicoes_do_dia.clear()
+            ultima_antes_de.clear()
             st.rerun()
 
     buscar = st.button("🔎 Baixar e analisar", type="primary", disabled=not escolhidas,
