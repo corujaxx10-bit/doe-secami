@@ -7,16 +7,23 @@ from .extracao import normalizar
 MODELO_PADRAO = "gemini-flash-lite-latest"  # apelido que o Google atualiza sozinho
 
 PROMPT = """Você analisa atos do Diário Oficial do Estado de Goiás.
-Abaixo há atos pré-selecionados por mencionarem a Secretaria de Estado da Casa Militar (SECAMI).
+SECAMI é a Secretaria de Estado da Casa Militar, órgão do Poder Executivo de Goiás (secretário-chefe: Cel. Marco Aurélio Godinho).
+Abaixo há atos pré-selecionados por mencionarem a SECAMI.
 Para CADA ato, devolva um objeto JSON. Regras:
 - Use SOMENTE informações escritas no texto. Não deduza nem complete nada.
 - Copie nomes de pessoas EXATAMENTE como no texto.
 - Se um ato trata de vários órgãos (ex.: decreto com várias nomeações), inclua apenas as pessoas ligadas à SECAMI/Casa Militar.
-- "relevante_secami": false se a menção à Casa Militar for incidental (ato de outro órgão sem efeito na SECAMI).
+- "relevante_secami": true SOMENTE se o ato for da SECAMI ou tratar de pessoa, cargo, comissão ou contrato da SECAMI.
+  Use false se a menção for incidental (ato de outro órgão sem efeito na SECAMI).
+- "Gabinete Militar" ou "Casa Militar" de OUTRO órgão (Tribunal de Justiça, Assembleia Legislativa, Ministério Público,
+  Tribunais de Contas, Defensoria, prefeituras, câmaras) NÃO é a SECAMI: use false.
+- Na dúvida se o ato é da SECAMI do Poder Executivo estadual, use false.
+- "trecho_secami": cópia LITERAL (até 200 caracteres) do trecho do ato que comprova a ligação com a SECAMI. Vazio se relevante_secami for false.
 - Em contratos, o "resumo" deve trazer: empresa contratada, objeto em poucas palavras, vigência e valor (se constarem).
 - categoria: "nomeacao", "exoneracao", "designacao" (comissões, gestores, fiscais, substitutos), "dispensa", "contrato", "outro".
 Formato (lista JSON):
 [{"protocolo": "...", "relevante_secami": true, "categoria": "...",
+  "trecho_secami": "cópia literal do trecho que liga o ato à SECAMI",
   "titulo_ato": "ex.: Portaria SECAMI nº 148/2026",
   "resumo": "uma frase objetiva do que o ato faz",
   "pessoas": [{"nome": "...", "cargo_ou_funcao": "...", "simbolo": "código do cargo, se houver, senão vazio",
@@ -138,6 +145,9 @@ def conferir_itens(itens, selecionados):
         it["pagina"] = ato["pagina"] if ato else "?"
         it["relevante_secami"] = it.get("relevante_secami", True) is not False  # na dúvida, entra
         it["categoria"] = _categoria_padrao(it.get("categoria"))
+        # prova de que o ato é da SECAMI: o trecho citado pela IA precisa existir no texto
+        trecho_n = normalizar(str(it.get("trecho_secami") or ""))
+        it["ligacao_ok"] = bool(trecho_n) and bool(orig) and trecho_n in orig
         it["titulo_ato"] = it.get("titulo_ato") or "Ato"
         it["resumo"] = it.get("resumo") or ""
         pessoas = []
@@ -154,7 +164,8 @@ def conferir_itens(itens, selecionados):
     for a in ausentes:
         linhas = [l.strip() for l in a["texto"].splitlines() if l.strip()]
         limpos.append({"protocolo": a["protocolo"], "pagina": a["pagina"], "relevante_secami": True,
-                       "categoria": "outro", "titulo_ato": linhas[0][:120] if linhas else "Ato",
+                       "categoria": "outro", "ligacao_ok": True,
+                       "titulo_ato": linhas[0][:120] if linhas else "Ato",
                        "resumo": "⚠️ não analisado pela IA – conferir no original.",
                        "pessoas": []})
     return limpos, [a["protocolo"] for a in ausentes]
