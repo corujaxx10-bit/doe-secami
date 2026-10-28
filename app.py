@@ -9,12 +9,13 @@ import urllib.parse
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+import streamlit.components.v1 as components
 
-from doe.atos import TERMOS_SECAMI
 from doe.coleta import ErroColeta, baixar_pdf, codigo_do_link, edicoes_da_data, ultima_edicao
 from doe.ia import MODELO_PADRAO
 from doe.mensagem import mensagem_unica
-from doe.pipeline import processar_pdf
+from doe.copiar import html_botao_copiar
+from doe.pipeline import VERSAO_LOGICA, bloco_final, item_incluido_manualmente, processar_pdf
 
 st.set_page_config(page_title="DOE-GO · SECAMI", page_icon="📰", layout="centered")
 
@@ -140,30 +141,51 @@ if pdfs:
             continue
         vistos.add(md5)
 
-        guardado = MEMORIA["resultados"].get(md5)
+        chave = f"v{VERSAO_LOGICA}:{md5}"  # a versão evita reaproveitar resultados de regras antigas
+        guardado = MEMORIA["resultados"].get(chave)
         if guardado:  # já analisado por alguém da equipe
             resultados.append({**guardado, "arquivo": nome})
             continue
         with st.status(f"📄 {nome}", expanded=True) as caixa:
-            r = processar_pdf(nome, dados, API_KEY, MEMORIA["ia"], avisar=caixa.write,
-                              termos=TERMOS_SECAMI)
+            r = processar_pdf(nome, dados, API_KEY, MEMORIA["ia"], avisar=caixa.write)
             caixa.update(label=f"📄 {nome} – nº {r['numero']}", state="error" if r["erro"] else "complete",
                          expanded=False)
         if r["erro"]:
             st.error(f"{nome}: {r['erro']}")
             continue
+        r["chave"] = chave
         if r["usou_ia"] or r["escaneado"]:  # resultado definitivo: guarda para a equipe
-            MEMORIA["resultados"][md5] = r
+            MEMORIA["resultados"][chave] = r
         resultados.append(r)
     st.session_state["resultados"] = resultados
 
 # ------------------------------------------------------------ Resultado
 resultados = st.session_state.get("resultados")
+
+# Atos que a PESSOA decidiu incluir à mão (valem só para esta sessão; não alteram o que a equipe vê)
+st.session_state.setdefault("incluidos", {})
+
+
+def com_inclusoes(lista):
+    """Devolve os resultados com os atos incluídos manualmente já dentro do bloco de cada edição."""
+    saida = []
+    for r in lista:
+        extras = [v for k, v in st.session_state["incluidos"].items()
+                  if k.startswith(r.get("chave", "?") + "|")]
+        saida.append({**r, "bloco": bloco_final(r, extras)} if extras else r)
+    return saida
+
+
 if resultados:
     st.divider()
     st.subheader("💬 Mensagem para o WhatsApp")
-    texto = st.text_area("Você pode ajustar o texto antes de enviar", mensagem_unica(resultados), height=320)
-    st.code(texto, language=None, wrap_lines=True)  # ícone de copiar no canto do quadro
+    n_manuais = len(st.session_state["incluidos"])
+    if n_manuais:
+        st.caption(f"✅ {n_manuais} ato(s) incluído(s) manualmente nesta mensagem (veja em Conferência).")
+    texto = st.text_area("Você pode ajustar o texto antes de enviar",
+                         mensagem_unica(com_inclusoes(resultados)), height=320,
+                         help="Depois de editar, clique fora da caixa antes de copiar.")
+    components.html(html_botao_copiar(texto), height=56)
     c1, c2 = st.columns(2)
     c1.link_button("📲 Abrir no WhatsApp", "https://wa.me/?text=" + urllib.parse.quote(texto),
                    use_container_width=True)
@@ -171,9 +193,11 @@ if resultados:
 
     st.subheader("🔍 Conferência por edição")
     for r in resultados:
+        n_conferir = len(r["a_conferir"])
         titulo = f"🚫 {r['arquivo']} (escaneado)" if r["escaneado"] else \
-                 f"nº {r['numero']} – {r['data']} · {len(r['selecionados'])} de {r['total_atos']} atos"
-        with st.expander(titulo):
+                 (f"nº {r['numero']} – {r['data']} · {len(r['selecionados'])} de {r['total_atos']} atos"
+                  + (f" · ⚠️ {n_conferir} a conferir" if n_conferir else ""))
+        with st.expander(titulo, expanded=bool(n_conferir)):
             if r["escaneado"]:
                 st.error("PDF sem texto legível. Faça a leitura manual desta edição.")
                 continue
@@ -185,6 +209,31 @@ if resultados:
             if r["incidentais"]:
                 st.info("Menção incidental, fora da mensagem: " + ", ".join(
                     f"{i['titulo_ato']} (prot. {i['protocolo']})" for i in r["incidentais"]))
+            if r["a_conferir"]:
+                st.warning(f"⚠️ {n_conferir} ato(s) citam 'casa/gabinete militar' mas **não foi possível "
+                           "confirmar que são da SECAMI**. Eles só entram na mensagem se você clicar em "
+                           "**Incluir**. Leia e decida:")
+                for a in r["a_conferir"]:
+                    st.markdown(f"**Protocolo {a['protocolo']}** · pág. {a['pagina']} · "
+                                f"{a['orgao'] or '—'} · _{a['motivo_filtro']}_")
+                    st.text(a.get("trecho", ""))
+                    ch = f"{r['chave']}|{a['protocolo']}"
+                    if ch in st.session_state["incluidos"]:
+                        col1, col2 = st.columns([3, 1])
+                        col1.success("✅ Incluído na mensagem")
+                        if col2.button("↩️ Remover", key=f"rem_{ch}", use_container_width=True):
+                            del st.session_state["incluidos"][ch]
+                            st.rerun()
+                    elif st.button("➕ Incluir na mensagem", key=f"inc_{ch}"):
+                        with st.spinner("Analisando o ato..."):
+                            item = item_incluido_manualmente(a, API_KEY, MEMORIA["ia"], avisar=st.write) \
+                                if r.get("itens") is not None else None
+                        st.session_state["incluidos"][ch] = {"ato": a, "item": item}
+                        st.rerun()
+            if r["descartados"]:
+                st.caption("Descartados por citarem 'casa/gabinete militar' de outro órgão: "
+                           + "; ".join(f"prot. {a['protocolo']} (pág. {a['pagina']}, {a['orgao'] or '—'})"
+                                       for a in r["descartados"]))
             for a in r["selecionados"]:
                 st.markdown(f"**Protocolo {a['protocolo']}** · pág. {a['pagina']} · {a['orgao'] or '—'} "
                             f"· _{a['motivo_filtro']}_")
